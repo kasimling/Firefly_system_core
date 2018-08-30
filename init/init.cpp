@@ -83,6 +83,8 @@ struct selabel_handle *sehandle_prop;
 
 static int property_triggers_enabled = 0;
 
+static char bootmode[32] = "unknow";
+static char hardware[32] = "rk30board";
 static char qemu[32];
 
 std::string default_console = "/dev/console";
@@ -102,6 +104,25 @@ static bool do_shutdown = false;
 void DumpState() {
     ServiceManager::GetInstance().DumpState();
     ActionManager::GetInstance().DumpState();
+}
+
+static int
+unix_read(int  fd, void*  buff, int  len) {
+    int  ret;
+    do { ret = read(fd, buff, len); } while (ret < 0 && errno == EINTR);
+        return ret;
+}
+        
+static int
+proc_read(const char*  filename, char* buff, size_t  buffsize) {
+    int  len = 0;
+    int  fd  = open(filename, O_RDONLY);
+    if (fd >= 0) {
+        len = unix_read(fd, buff, buffsize-1);
+        close(fd);
+    }
+    buff[len > 0 ? len : 0] = 0;
+    return len;
 }
 
 void register_epoll_handler(int fd, void (*fn)()) {
@@ -498,7 +519,34 @@ static void export_oem_lock_status() {
     }
 }
 
+static void symlink_fstab() {
+    char fstab_path[255] = "/fstab.";
+    char fstab_default_path[50] = "/fstab.";
+    int ret = -1;
+
+    //such as: fstab.rk30board.bootmode.unknown
+    strcat(fstab_path, hardware);
+    strcat(fstab_path, ".bootmode.");
+    strcat(fstab_path, bootmode);
+    std::string soc_value = GetProperty("ro.rk.soc", "");
+    if (soc_value.find("rk3288") != std::string::npos) {
+        strcat(fstab_path, ".");
+        strcat(fstab_path, soc_value.c_str());
+    }
+    strcat(fstab_default_path, hardware);
+    ret = symlink(fstab_path, fstab_default_path);
+    if (ret < 0) {
+        LOG(ERROR) << __func__ << " : failed";
+    }
+}
+
 static void export_kernel_boot_props() {
+    char cmdline[1024];
+    char* s1;
+    char* s2;
+    char* s3;
+    char* s4;
+
     struct {
         const char *src_prop;
         const char *dst_prop;
@@ -511,10 +559,52 @@ static void export_kernel_boot_props() {
         { "ro.boot.hardware",   "ro.hardware",   "unknown", },
         { "ro.boot.revision",   "ro.revision",   "0", },
     };
+
+    //if storagemedia is emmc, so we will wait emmc init finish
+    for (int i = 0; i < EMMC_RETRY_COUNT; i++) {
+        proc_read( "/proc/cmdline", cmdline, sizeof(cmdline) );
+        s1 = strstr(cmdline, STORAGE_MEDIA);
+        s2 = strstr(cmdline, "androidboot.mode=emmc");
+	s3 = strstr(cmdline, "storagemedia=nvme");
+	s4 = strstr(cmdline, "androidboot.mode=nvme");
+
+        if ((s1 == NULL) && (s3 == NULL)) {
+            //storagemedia is unknow
+            break;
+        }
+
+        if (s1 && s2) {
+            LOG(ERROR) << "OK,EMMC DRIVERS INIT OK\n";
+            property_set("ro.boot.mode", "emmc");
+            break;
+        } else if (s3 && s4) {
+	    LOG(ERROR) << "OK,NVME DRIVERS INIT OK\n";
+	    property_set("ro.boot.mode", "nvme");
+	    break;
+	} else {
+            LOG(ERROR) << "OK,EMMC DRIVERS NOT READY, RERRY=" << i << "\n";
+            usleep(10000);
+        }
+    }
+
     for (size_t i = 0; i < arraysize(prop_map); i++) {
         std::string value = GetProperty(prop_map[i].src_prop, "");
         property_set(prop_map[i].dst_prop, (!value.empty()) ? value : prop_map[i].default_value);
     }
+
+    /* save a copy for init's usage during boot */
+    std::string bootmode_value = GetProperty("ro.bootmode", "unknown");
+    if (!bootmode_value.empty())
+        strlcpy(bootmode, bootmode_value.c_str(), sizeof(bootmode));
+
+    /* if this was given on kernel command line, override what we read
+     * before (e.g. from /proc/cpuinfo), if anything */
+    std::string hardware_value = GetProperty("ro.boot.hardware", "unknown");
+    if (!hardware_value.empty())
+        strlcpy(hardware, hardware_value.c_str(), sizeof(hardware));
+    property_set("ro.hardware", hardware);
+
+    symlink_fstab();
 }
 
 static void process_kernel_dt() {
@@ -538,6 +628,89 @@ static void process_kernel_dt() {
         std::replace(dt_file.begin(), dt_file.end(), ',', '.');
 
         property_set("ro.boot."s + dp->d_name, dt_file);
+    }
+}
+
+/*
+ * busybox hd /proc/device-tree/compatible
+ * 00000000  72 6f 63 6b 63 68 69 70  2c 72 6b 33 32 38 38 2d  |rockchip,rk3288-|
+ * 00000010  65 76 62 2d 72 6b 38 31  38 00 72 6f 63 6b 63 68  |evb-rk818.rockch|
+ * 00000020  69 70 2c 72 6b 33 32 38  38 00                    |ip,rk3288.|
+ * 0000002a
+ *
+ * Conver content of this node to readable soc string
+*/
+static int convert_compat(char *compat, const size_t len, char *soc)
+{
+    // count entries
+    int entries = 0;
+    // each '\0' is end of an entry
+    for(const char *p = compat; (size_t) (p - compat) < len; ++p) {
+        if(*p == '\0')
+            entries += 1;
+    }
+
+    // alloc pointers for entries and one pointer for last NULL
+    char **array = (char **) malloc((entries + 1) * sizeof(char *));
+    if(array == NULL)
+        return -1;
+
+    // assign pointers to point into the compat string
+    int off = 0;
+    for(int i = 0; i < entries; ++i) {
+        array[i] = compat + off;
+        // find next end of entry
+        while(compat[off] != '\0')
+            off += 1;
+
+        off += 1; // skip '\0', point to the next entry
+    }
+
+    // find chip offset("rockchip,rk3288w")
+    array[entries -1] = strstr(array[entries -1], ",");
+
+    // copy soc name to OUT arg
+    strlcpy(soc, array[entries -1] + 1, strlen(array[entries -1]));
+
+    free(array);
+    return 0;
+}
+
+static void set_soc_if_need() {
+    std::string soc_value = GetProperty("ro.rk.soc", "unknown");
+    if (soc_value.empty()) {
+        //First probe soc running on kernel 3.10
+        int fd;
+        char buf[256];
+
+        fd = open("/sys/devices/system/cpu/soc", O_RDONLY);
+        if (fd >= 0) {
+            int n = read(fd, buf, sizeof(buf) - 1);
+            if (n > 0) {
+                if (buf[n-1] == '\n')
+                    n--;
+                buf[n] = 0;
+                LOG(ERROR) << "Setting ro.rk.soc=" << buf;
+                property_set("ro.rk.soc", buf);
+                close(fd);
+                return;
+            }
+            close(fd);
+        }
+
+        //Probe for soc running on kernel 4.4
+        fd = open("/proc/device-tree/compatible", O_RDONLY);
+        if (fd >= 0) {
+            int n = read(fd, buf, sizeof(buf));
+            if (n > 0) {
+                char soc[16];
+                if (!convert_compat(buf, n, soc)) {
+                    LOG(ERROR) << "Setting ro.rk.soc=" << soc;
+                    property_set("ro.rk.soc", soc);
+                }
+            }
+            close(fd);
+        }
     }
 }
 
@@ -1086,6 +1259,10 @@ int main(int argc, char** argv) {
     // properties set in DT always have priority over the command-line ones.
     process_kernel_dt();
     process_kernel_cmdline();
+
+    //add by xzj to set ro.rk.soc read from /proc/cpuinfo if not set
+    set_soc_if_need();
+
 
     // Propagate the kernel variables to internal variables
     // used by init as well as the current required properties.

@@ -28,6 +28,10 @@ namespace init {
 // watchdogd, or any files that may be included in those, such as devices.cpp and util.cpp.
 // TODO: Have an Init class and remove all globals.
 extern const char *ENV[32];
+/* IMPORTANT: THE VALUE OF STORAGE_MEDIA MUST BE CONSISTANT WITH UBOOT */
+#define EMMC_RETRY_COUNT 200
+#define STORAGE_MEDIA "storagemedia=emmc"
+
 extern std::string default_console;
 extern struct selabel_handle *sehandle;
 extern struct selabel_handle *sehandle_prop;
